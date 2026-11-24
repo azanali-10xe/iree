@@ -23,6 +23,7 @@
 #include "iree/compiler/Dialect/TensorExt/IR/TensorExtOps.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
@@ -40,6 +41,8 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/OpDefinition.h"
+#include "mlir/Interfaces/DestinationStyleOpInterface.h"
+#include "mlir/Interfaces/TilingInterface.h"
 #include "mlir/Interfaces/ValueBoundsOpInterface.h"
 #include "mlir/Transforms/LoopInvariantCodeMotionUtils.h"
 
@@ -1382,6 +1385,104 @@ struct FoldFillIntoPad : OpRewritePattern<tensor::PadOp> {
 
 void populateFoldFillIntoPadPattern(RewritePatternSet &patterns) {
   patterns.insert<FoldFillIntoPad>(patterns.getContext());
+}
+
+/// Returns true if `paddedSize` is provably at least the size of dimension
+/// `dim` of `tensor`.
+static bool isProvablyAtLeastDimSize(OpFoldResult paddedSize, Value tensor,
+                                     int64_t dim) {
+  std::optional<int64_t> paddedConst = getConstantIntValue(paddedSize);
+  int64_t size = cast<RankedTensorType>(tensor.getType()).getDimSize(dim);
+  if (paddedConst && ShapedType::isStatic(size)) {
+    return *paddedConst >= size;
+  }
+  return ValueBoundsConstraintSet::compare(
+      ValueBoundsConstraintSet::Variable(paddedSize),
+      ValueBoundsConstraintSet::GE,
+      ValueBoundsConstraintSet::Variable(tensor, dim));
+}
+
+/// Returns a slice of `tensor` cropped to `paddedShape` in every dimension that
+/// is not provably within it, or a null value when no dimension needs it.
+static Value createCropToPaddedShape(OpBuilder &builder, Location loc,
+                                     Value tensor,
+                                     ArrayRef<OpFoldResult> paddedShape) {
+  int64_t rank = cast<RankedTensorType>(tensor.getType()).getRank();
+  assert(static_cast<int64_t>(paddedShape.size()) == rank &&
+         "expected one padded size per tensor dimension");
+  llvm::SmallBitVector cropDims(rank);
+  for (int64_t dim = 0; dim < rank; ++dim) {
+    cropDims[dim] = !isProvablyAtLeastDimSize(paddedShape[dim], tensor, dim);
+  }
+  if (cropDims.none()) {
+    return Value();
+  }
+
+  AffineMap minMap = AffineMap::getMultiDimIdentityMap(2, builder.getContext());
+  SmallVector<OpFoldResult> croppedSizes;
+  croppedSizes.reserve(rank);
+  for (int64_t dim = 0; dim < rank; ++dim) {
+    OpFoldResult size = tensor::getMixedSize(builder, loc, tensor, dim);
+    if (!cropDims[dim]) {
+      croppedSizes.push_back(size);
+      continue;
+    }
+    croppedSizes.push_back(affine::makeComposedFoldedAffineMin(
+        builder, loc, minMap, {size, paddedShape[dim]}));
+  }
+  SmallVector<OpFoldResult> offsets(rank, builder.getIndexAttr(0));
+  SmallVector<OpFoldResult> strides(rank, builder.getIndexAttr(1));
+  return tensor::ExtractSliceOp::create(builder, loc, tensor, offsets,
+                                        croppedSizes, strides);
+}
+
+/// Replaces each DPS input of `op` that extends beyond its padded shape with a
+/// slice of the region the padded op reads.
+static void
+cropInputsToPaddedShapes(OpBuilder &builder, TilingInterface op,
+                         const linalg::PadTilingInterfaceOptions &options,
+                         const linalg::PadSizeComputationFunction &computeFn) {
+  auto dpsOp = dyn_cast<DestinationStyleOpInterface>(op.getOperation());
+  if (!dpsOp) {
+    return;
+  }
+  OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPoint(op);
+  SmallVector<Range> iterationDomain = op.getIterationDomain(builder);
+  bool modified = false;
+  for (OpOperand *input : dpsOp.getDpsInputOperands()) {
+    if (!isa<RankedTensorType>(input->get().getType())) {
+      continue;
+    }
+    // A failure here also fails the padding that follows, which reports it.
+    FailureOr<SmallVector<OpFoldResult>> paddedShape =
+        computeFn(builder, *input, iterationDomain, options);
+    if (failed(paddedShape)) {
+      continue;
+    }
+    Value cropped = createCropToPaddedShape(builder, op.getLoc(), input->get(),
+                                            *paddedShape);
+    if (!cropped) {
+      continue;
+    }
+    input->set(cropped);
+    modified = true;
+  }
+  if (!modified) {
+    return;
+  }
+  if (auto *listener =
+          dyn_cast_if_present<RewriterBase::Listener>(builder.getListener())) {
+    listener->notifyOperationModified(op);
+  }
+}
+
+FailureOr<linalg::PadTilingInterfaceResult> cropAndPadTilingInterfaceOp(
+    OpBuilder &builder, TilingInterface op,
+    const linalg::PadTilingInterfaceOptions &options,
+    const linalg::PadSizeComputationFunction &computePaddingSizeFn) {
+  cropInputsToPaddedShapes(builder, op, options, computePaddingSizeFn);
+  return linalg::rewriteAsPaddedOp(builder, op, options, computePaddingSizeFn);
 }
 
 } // namespace mlir::iree_compiler

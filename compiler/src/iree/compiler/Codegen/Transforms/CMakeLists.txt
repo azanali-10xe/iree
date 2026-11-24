@@ -26,6 +26,7 @@ iree_cc_library(
     MLIRAffineUtils
     MLIRAnalysis
     MLIRArithDialect
+    MLIRDestinationStyleOpInterface
     MLIRFuncDialect
     MLIRFunctionInterfaces
     MLIRIR
@@ -36,6 +37,7 @@ iree_cc_library(
     MLIRSCFTransforms
     MLIRSupport
     MLIRTensorDialect
+    MLIRTilingInterface
     MLIRTransformUtils
     MLIRTransforms
     MLIRValueBoundsOpInterface
